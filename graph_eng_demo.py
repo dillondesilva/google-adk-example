@@ -7,31 +7,20 @@ Pipeline: two researchers run in parallel -> a drafter merges their
 findings -> a critic reviews the draft in a loop until it passes.
 """
 
-from google.adk.agents import LlmAgent, SequentialAgent, ParallelAgent, LoopAgent
-from google.adk.tools.tool_context import ToolContext
+from typing import Literal
+
+from google.adk import Event, Workflow
+from google.adk.agents import LlmAgent
+from google.adk.workflow import JoinNode
 from google.genai import types
+from pydantic import BaseModel
 
 MODEL = "gemini-3.6-flash"
 
 
 # ---------------------------------------------------------------------------
-# Runtime state: the "exit_loop" tool is how the Critic writes a signal into
-# the shared runtime state that the LoopAgent itself reads to decide whether
-# to keep iterating. This is the mechanism, not the record -- ADK's actual
-# runtime state graph is session.state (the output_key writes below) plus
-# the event history, which every agent shares.
-# ---------------------------------------------------------------------------
-def exit_loop(tool_context: ToolContext):
-    """Call this once the draft passes review."""
-    tool_context.actions.escalate = True
-    return {"status": "approved"}
-
-
-# ---------------------------------------------------------------------------
-# Agent coordination graph: who exists, what they can do, and who they are
-# relative to each other. Nothing here says *when* they run -- that's the
-# task organization graph below. Capability = the tools/instruction each
-# agent gets; team = the sub_agents nesting a few lines down.
+# Agent coordination graph: who exists and what they can do. These are nodes.
+# Nothing here says *when* they run -- that's the edges= list below.
 # ---------------------------------------------------------------------------
 researcher_a = LlmAgent(
     name="researcher_a",
@@ -59,54 +48,66 @@ drafter = LlmAgent(
     output_key="draft",
 )
 
+
+class Review(BaseModel):
+    verdict: Literal["approved", "revise"]
+    feedback: str = ""
+
+
 critic = LlmAgent(
     name="critic",
     model=MODEL,
     instruction=(
-        "Review {draft}. If it is clear and well-supported, call exit_loop. "
-        "Otherwise, write one sentence of feedback."
+        "Review {draft}. If it is clear and well-supported, verdict=approved. "
+        "Otherwise verdict=revise and write one sentence of feedback."
     ),
-    tools=[exit_loop],
-    output_key="feedback",
+    output_schema=Review,
 )
+
+
+# Workflow loops need a routed Event -- unconditional cycles are rejected.
+# `route` is the edge label; `state` writes feedback for the next draft.
+def route(node_input: Review):
+    return Event(
+        route=node_input.verdict,
+        state={"feedback": node_input.feedback},
+        message=node_input.verdict,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Task organization graph: the actual dependency structure -- what runs in
-# parallel, what runs in sequence, and what loops. This is a *different*
-# object from the agent coordination graph above: swap drafter for a
-# different agent and this structure doesn't change at all.
+# Task organization graph: the edges. Nested tuple = parallel fan-out,
+# JoinNode = fan-in, dict = conditional loop. Swap drafter for a different
+# agent and this structure does not change.
+#
+#   START -> (researcher_a || researcher_b) -> join -> drafter -> critic -> route
+#              ^                                                        |
+#              +---------------------- "revise" ------------------------+
+#                                       "approved" ends the run
 # ---------------------------------------------------------------------------
-research_phase = ParallelAgent(
-    name="research_phase",
-    sub_agents=[researcher_a, researcher_b],
-)
+join = JoinNode(name="join")
 
-review_loop = LoopAgent(
-    name="review_loop",
-    sub_agents=[drafter, critic],
-    max_iterations=3,
-)
-
-report_pipeline = SequentialAgent(
+report_pipeline = Workflow(
     name="report_pipeline",
-    sub_agents=[research_phase, review_loop],
+    edges=[
+        ("START", (researcher_a, researcher_b), join, drafter, critic, route),
+        (route, {"revise": drafter}),
+    ],
 )
 
 
 # ---------------------------------------------------------------------------
-# Runtime state, made visible: after a run, session.state is the queryable
-# record of what actually happened -- research_a, research_b, draft, and
-# feedback all live here, written by different agents at different times.
-# This is the coupling layer between the two graphs above.
+# Runtime state: after a run, session.state is the record of what happened --
+# research_a, research_b, draft, feedback. Written by different nodes at
+# different times. This is the coupling layer between the two graphs above.
 # ---------------------------------------------------------------------------
-def main():
+if __name__ == "__main__":
     from dotenv import load_dotenv
     from google.adk.runners import InMemoryRunner
 
     load_dotenv()
 
-    runner = InMemoryRunner(agent=report_pipeline, app_name="graph_eng_demo")
+    runner = InMemoryRunner(node=report_pipeline, app_name="graph_eng_demo")
     session = runner.session_service.create_session_sync(
         app_name="graph_eng_demo", user_id="demo_user"
     )
@@ -119,8 +120,6 @@ def main():
             role="user",
             parts=[types.Part(text=f"topic: {topic}")],
         ),
-        # {topic} in instructions is filled from session.state, not the user
-        # message text -- this is the runtime-state coupling layer.
         state_delta={"topic": topic},
     ):
         if event.content and event.content.parts and event.content.parts[0].text:
@@ -129,10 +128,6 @@ def main():
     final_state = runner.session_service.get_session_sync(
         app_name="graph_eng_demo", user_id="demo_user", session_id=session.id
     ).state
-    print("\n--- runtime state graph ---")
+    print("\n--- runtime state ---")
     for key, value in final_state.items():
         print(f"{key}: {value}")
-
-
-if __name__ == "__main__":
-    main()
